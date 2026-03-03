@@ -1,16 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 YOLOv8 单类分割 + MediaPipe Hand Landmarker + 光流追踪（多边形）
-更新点（本版重点）：
-- 左下角第二个进度条"距离(≈1)" 已完全替换为：ratio = 物体面积 / 手面积 的"接近 1 程度"可视化
-  -> range_score = 1 - clamp(|ratio - 1| / RATIO_TOL, 0..1)
-  -> 画面同时显示 ratio 数值；ratio<1 提示"向前靠近"，ratio>1 提示"后退"，在 [1±RATIO_TOL] 内为"保持"
-其他特性：
-- Enter 锁定：在分割掩码"内收 5px"的内边界上取光流点
-- TRACK 期间：监控当前多边形外扩 40px 周边区域的分割，命中即重锁
-- 成功判定：放宽"握持(Grasp)"启发式（拿瓶子无需特别紧）
-- 手骨架单色渲染；测距箭头（端点定位线 + 箭头 + 像素值）
-- 中文绘制优先 Pillow + 系统中文字体（避免问号）
+服务器版本 - 专用于ESP32数据源，移除前端和音频功能
+提供REST API接口供其他程序获取检测结果
 """
 
 import os
@@ -21,152 +13,132 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from mediapipe.framework.formats import landmark_pb2
-from ultralytics import YOLO
-from ultralytics.utils.plotting import Colors
-import bridge_io
-import pygame  # 用于播放本地音频文件
+import queue
+import json
+import logging
+from typing import Optional, Dict, Any, Tuple, List, Union
+from datetime import datetime
 
-from audio_player import play_audio_threadsafe
-PERF_DEBUG = False        # 打印调试信息（False 关闭）
-HAND_DOWNSCALE = 0.8      # HandLandmarker 的输入缩放 0.5=长宽各减半（≈1/4 像素量）
-HAND_FPS_DIV = 1          # 人手每 2 帧跑一次（1=每帧；2=隔帧；3=每3帧）
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
+# ========= 配置参数 =========
+PERF_DEBUG = False
+HAND_DOWNSCALE = 0.8
+HAND_FPS_DIV = 1
 
-# === 前端风格配色（BGR） + UI叠加管理（左下角按行堆叠） ===
-FRONTEND_COLORS = {
-    "text": (230, 237, 243),   # --text: #e6edf3
-    "muted": (159, 176, 195),  # --muted: #9fb0c3
-    "ok": (126, 231, 135),     # --ok: #7ee787
-    "err": (128, 128, 255),    # --err: #ff8080 (BGR)
-    "accent": (251, 218, 97),  # #61dafb 近似的强调色（BGR 取近似亮色）
-}
+# 输入源配置 - 强制使用ESP32
+INPUT_SOURCE = "esp32"
+INPUT_W, INPUT_H = 600, 480
 
-# 底部指令按钮文本
-CURRENT_COMMAND_TEXT = "—"
+# 模型路径
+HAND_TASK_PATH = r"model\hand_landmarker.task"
 
-_UI_LINE = 0
-_UI_H = 0
-_UI_TR_LINE = 0  # 右上角逐行叠放计数
-_UI_TOP_MARGIN = 12
-_UI_RIGHT_MARGIN = 12
-UNIFIED_FONT_PX = 12  # 统一字号
+# 分割参数
+STROKE_WIDTH = 5
+MASK_ALPHA = 0.45
+CONF_THRESHOLD = 0.20
+PROMPT_NAME = "AD_milk"
 
+# 其他参数
+ALIGN_LOOSE_PCT = 0.12
+RATIO_IDEAL = 1.0
+RATIO_TOL = 0.25
+INNER_OFFSET_PX_LOCK = 5
+EDGE_DILATE_PX = 2
+PERI_MONITOR_PX = 40
+PERI_CHECK_EVERY = 5
+CONTOUR_EPSILON_FACTOR = 0.002
+TRACK_EPSILON_FACTOR = 0.003
+YOLO_CORRECTION_IOU_THRESHOLD = 0.2
+YOLO_CORRECTION_CONF_THRESHOLD = 0.15
 
-def ui_reset_overlay(img_h: int):
-    """每帧调用一次，重置叠加行计数（改为右上角布局）。"""
-    global _UI_LINE, _UI_H, _UI_TR_LINE
-    _UI_LINE = 0
-    _UI_TR_LINE = 0
-    _UI_H = int(img_h)
+# ========= MediaPipe 配置 =========
+BaseOptions = mp.tasks.BaseOptions
+VisionRunningMode = mp.tasks.vision.RunningMode
+HandLandmarker = mp.tasks.vision.HandLandmarker
+HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
+HAND_CONNECTIONS = mp.solutions.hands.HAND_CONNECTIONS
 
-
-def _ui_next_y_top(font_size: int) -> int:
-    """返回右上角下一行的y(顶部对齐)，并推进行计数。"""
-    global _UI_TR_LINE
-    line_gap = max(4, int(font_size * 0.25))
-    y_top = _UI_TOP_MARGIN + (_UI_TR_LINE * (font_size + line_gap))
-    _UI_TR_LINE += 1
-    return y_top
-
-
-def set_current_command(text: str):
-    global CURRENT_COMMAND_TEXT
-    try:
-        CURRENT_COMMAND_TEXT = str(text) if text else "—"
-    except Exception:
-        CURRENT_COMMAND_TEXT = "—"
-
-
-def draw_command_pill(img_bgr: np.ndarray, label: str):
-    """统一改为右上角白色文案。不再绘制底部圆角按钮。"""
-    text_prefix = "当前指令："
-    full_text = f"{text_prefix}{label if label else '—'}"
-    # 直接用统一文本渲染
-    draw_text_cn(img_bgr, full_text, (0, 0), font_size=UNIFIED_FONT_PX, color=(255,255,255), ui_hint=True)
-
+# 尝试导入YOLOE后端
 try:
     from yoloe_backend import YoloEBackend
     _YOLOE_READY = True
 except Exception as e:
     _YOLOE_READY = False
-    print(f"[DETECTOR] YOLOE backend not ready: {e}", flush=True)
+    logger.warning(f"YOLOE backend not ready: {e}")
 
-# ========= 路径参数（按需修改）=========
-YOLO_MODEL_PATH = r'C:\Users\Administrator\Desktop\rebuild1002\model\shoppingbest5.pt'
-HAND_TASK_PATH  = r"C:\Users\Administrator\Desktop\rebuild1002\model\hand_landmarker.task"
+# ========= 结果队列（用于API访问）=========
+class ResultQueue:
+    def __init__(self, max_size=100):
+        self.queue = queue.Queue(maxsize=max_size)
+        self.latest_result = None
+        self.lock = threading.Lock()
+        self.stats = {
+            "total_frames": 0,
+            "processed_frames": 0,
+            "start_time": time.time(),
+            "last_update": time.time()
+        }
+    
+    def put(self, result: Dict[str, Any]):
+        """放入结果"""
+        with self.lock:
+            self.latest_result = result
+            self.stats["total_frames"] += 1
+            self.stats["processed_frames"] += 1
+            self.stats["last_update"] = time.time()
+            
+            try:
+                self.queue.put_nowait(result)
+            except queue.Full:
+                # 如果队列满了，移除最旧的结果
+                try:
+                    self.queue.get_nowait()
+                except queue.Empty:
+                    pass
+                self.queue.put_nowait(result)
+    
+    def get_latest(self) -> Optional[Dict[str, Any]]:
+        """获取最新结果"""
+        with self.lock:
+            return self.latest_result
+    
+    def get_all(self, max_items: int = 10) -> List[Dict[str, Any]]:
+        """获取最近的结果"""
+        results = []
+        with self.lock:
+            # 清空队列并获取所有结果
+            while not self.queue.empty():
+                try:
+                    results.append(self.queue.get_nowait())
+                except queue.Empty:
+                    break
+        
+        # 只返回最新的几个结果
+        return results[-max_items:]
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """获取统计信息"""
+        with self.lock:
+            elapsed = time.time() - self.stats["start_time"]
+            fps = self.stats["processed_frames"] / max(elapsed, 0.001)
+            
+            return {
+                "total_frames": self.stats["total_frames"],
+                "processed_frames": self.stats["processed_frames"],
+                "fps": round(fps, 2),
+                "uptime_seconds": round(elapsed, 2),
+                "last_update": datetime.fromtimestamp(self.stats["last_update"]).isoformat(),
+                "queue_size": self.queue.qsize()
+            }
 
-# ========= 摄像头 =========
-CAM_INDEX = 0
-INPUT_W, INPUT_H = 600, 480
-
-# ========= 分割显示 =========
-STROKE_WIDTH = 5  # 增加描边宽度，让黄框和绿框更粗
-MASK_ALPHA   = 0.45
-CONF_THRESHOLD = 0.20
-
-# —— 单 prompt 识别（只显示一个类）——
-PROMPT_NAME   = "AD_milk"
-PROMPT_STRICT = True
-
-# ========= 对齐条参数 =========
-ALIGN_LOOSE_PCT      = 0.12   # 归一化距离阈（相对画面对角线）
-
-# ========= 距离条参数（本版采用"ratio≈1"为目标）=========
-RATIO_IDEAL          = 1.0    # 理想值：物体面积/手面积 ≈ 1
-RATIO_TOL            = 0.25   # 容许偏离：±25% 内认为距离合适
-
-# ========= 语音播报 =========
-TTS_INTERVAL_SEC     = 1.0
-ENABLE_TTS           = True
-
-# ========= 光流（LK）与特征点 =========
-LK_PARAMS = dict(winSize=(21, 21),
-                 maxLevel=3,
-                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 12, 0.03))
-FEATURE_PARAMS = dict(maxCorners=600,
-                      qualityLevel=0.001,
-                      minDistance=5,
-                      blockSize=7)
-
-# ========= 关键参数：内收与周边监控 =========
-INNER_OFFSET_PX_LOCK = 5     # Enter 锁定：掩码腐蚀像素，保证点在物体内部
-EDGE_DILATE_PX       = 2     # 取内边界后小膨胀，利于提点
-PERI_MONITOR_PX      = 40    # TRACK：监控多边形外扩 40px 的周边带
-PERI_CHECK_EVERY     = 5     # 每隔 N 帧做一次周边分割检查，改为每帧
-
-# ========= 轮廓精度参数 =========
-CONTOUR_EPSILON_FACTOR = 0.002  # Douglas-Peucker算法的精度因子，越小越精细
-TRACK_EPSILON_FACTOR = 0.003    # 追踪模式下的轮廓精度因子
-
-# ========= YOLO实时矫正参数 =========
-YOLO_CORRECTION_IOU_THRESHOLD = 0.2  # IoU阈值，越低越积极矫正
-YOLO_CORRECTION_CONF_THRESHOLD = 0.15  # 置信度阈值，越低检测越敏感
-
-# ========= 方向引导音频路径 =========
-AUDIO_DIR = r"E:\沙粒云\自媒体\2025视频制作\20250925AI眼镜\AI眼镜合并\audio"  # 请修改为实际路径
-AUDIO_FILES = {
-    "向上": os.path.join(AUDIO_DIR, "up.wav"),
-    "向下": os.path.join(AUDIO_DIR, "down.wav"),
-    "向左": os.path.join(AUDIO_DIR, "left.wav"),
-    "向右": os.path.join(AUDIO_DIR, "right.wav"),
-    "向前": os.path.join(AUDIO_DIR, "forward.wav"),
-    "后退": os.path.join(AUDIO_DIR, "backward.wav"),
-    "OK": os.path.join(AUDIO_DIR, "ok.wav"),  # 添加OK音效
-}
-GUIDANCE_INTERVAL_SEC = 1.5  # 引导播报间隔
-
-# 初始化pygame音频
-pygame.mixer.init()
-
-# ========= 窗口 =========
-WINDOW = "YOLO Seg + Flow Polygon (Peri-Relock) (Grab Guidance)"
-
-# ======== MediaPipe 别名 ========
-BaseOptions           = mp.tasks.BaseOptions
-VisionRunningMode     = mp.tasks.vision.RunningMode
-HandLandmarker        = mp.tasks.vision.HandLandmarker
-HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-HAND_CONNECTIONS      = mp.solutions.hands.HAND_CONNECTIONS
+# 全局结果队列
+result_queue = ResultQueue()
 
 # ======== HandLandmarker 回调缓存 ========
 _last_result = None  # (result, timestamp_ms)
@@ -183,152 +155,8 @@ def _to_proto(hand_lms) -> landmark_pb2.NormalizedLandmarkList:
     ])
     return proto
 
-# —— 手骨架单色渲染 —— #
-def draw_hands_mono(img_bgr, hand_lms, color=(0, 255, 255), r=2, t=2):
-    mp_drawing = mp.solutions.drawing_utils
-    landmark_spec   = mp_drawing.DrawingSpec(color=color, thickness=-1, circle_radius=r)
-    connection_spec = mp_drawing.DrawingSpec(color=color, thickness=t,  circle_radius=r)
-    if hasattr(hand_lms, "landmark"):
-        proto = hand_lms
-    else:
-        proto = _to_proto(hand_lms)
-    mp_drawing.draw_landmarks(
-        img_bgr,
-        landmark_list=proto,
-        connections=HAND_CONNECTIONS,
-        landmark_drawing_spec=landmark_spec,
-        connection_drawing_spec=connection_spec,
-    )
-
-def norm_name(s: str) -> str:
-    return "".join(str(s).lower().split())
-
-# ======== TTS（pyttsx3）========
-class Speaker:
-    def __init__(self, enable=True):
-        self.enable = enable
-        self._engine = None
-        self._lock = threading.Lock()
-        if enable:
-            try:
-                import pyttsx3
-                self._engine = pyttsx3.init()
-                self._engine.setProperty('rate', 190)
-                self._engine.setProperty('volume', 1.0)
-            except Exception:
-                self._engine = None
-                self.enable = False
-
-    def say_async(self, text: str):
-        if not self.enable or not text:
-            return
-        def _run():
-            try:
-                with self._lock:
-                    self._engine.stop()
-                    self._engine.say(text)
-                    self._engine.iterate()
-                    t0 = time.time()
-                    while self._engine.isBusy() and (time.time() - t0) < 1.2:
-                        self._engine.iterate()
-                        time.sleep(0.01)
-            except Exception:
-                pass
-        threading.Thread(target=_run, daemon=True).start()
-
-# ======== 中文文本绘制（优先 Pillow）========
-_PIL_OK = False
-_FONT_PATH = None
-def _init_font():
-    global _PIL_OK, _FONT_PATH
-    try:
-        from PIL import ImageFont  # noqa
-        _PIL_OK = True
-    except Exception:
-        _PIL_OK = False
-        return
-    candidates = [
-        r"C:\\Windows\\Fonts\\msyh.ttc",
-        r"C:\\Windows\\Fonts\\msyh.ttf",
-        r"C:\\Windows\\Fonts\\simhei.ttf",
-        r"C:\\Windows\\Fonts\\simfang.ttf",
-        r"C:\\Windows\\Fonts\\simsun.ttc",
-        r"C:\\Windows\\Fonts\\simsunb.ttf",
-    ]
-    for p in candidates:
-        if os.path.exists(p):
-            _FONT_PATH = p
-            return
-    _PIL_OK = False
-_init_font()
-
-def draw_text_cn(img_bgr, text, xy, font_size=20, color=(255,255,255), stroke=None, ui_hint=True):
-    """
-    统一的文本绘制：
-    - 默认采用前端风格：小字体、左下角按行堆叠(ui_hint=True)。
-    - 若 ui_hint=False 则按传入 xy 精确定位（用于贴近目标的小标注）。
-    """
-    # 统一样式：微软雅黑 + 固定字号 + 纯白
-    color = (255, 255, 255)
-    font_size = int(UNIFIED_FONT_PX)
-
-    H, W = img_bgr.shape[:2]
-    # 右上角堆叠布局：计算y顶边，并按文本宽度右对齐
-    y_top = _ui_next_y_top(font_size) if ui_hint else _ui_next_y_top(font_size)
-    # 先估算文本尺寸
-    tw = th = 0
-    font_obj = None
-
-    if _PIL_OK and _FONT_PATH:
-        try:
-            from PIL import Image, ImageDraw, ImageFont
-            font_obj = ImageFont.truetype(_FONT_PATH, font_size)
-            # 计算文本尺寸
-            bbox = ImageDraw.Draw(Image.new('RGB', (1,1))).textbbox((0,0), text, font=font_obj)
-            tw = max(1, bbox[2] - bbox[0])
-            th = max(1, bbox[3] - bbox[1])
-        except Exception:
-            pass
-    if _PIL_OK and _FONT_PATH and font_obj is not None:
-        try:
-            from PIL import Image, ImageDraw
-            img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(img_rgb)
-            draw = ImageDraw.Draw(pil_img)
-            x = max(8, W - _UI_RIGHT_MARGIN - tw)
-            y = y_top
-            draw.text((x, y), text, fill=(255,255,255), font=font_obj)
-            img_bgr[:] = cv2.cvtColor(np.asarray(pil_img), cv2.COLOR_RGB2BGR)
-            return
-        except Exception:
-            pass
-    # OpenCV 回退：估算尺寸并右对齐
-    if tw <= 0 or th <= 0:
-        scale = font_size/24.0
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 2)
-    x = max(8, W - _UI_RIGHT_MARGIN - int(tw))
-    y_baseline = int(y_top + th)
-    cv2.putText(img_bgr, text, (x, y_baseline), cv2.FONT_HERSHEY_SIMPLEX, font_size/24.0, color, 2, cv2.LINE_AA)
-
 # ======== 工具函数 ========
 def clamp01(x): return max(0.0, min(1.0, x))
-
-def draw_progress_bars(vis, align_score, range_score):
-    """第一条=对齐，第二条=距离(≈1)，对应 ratio 与 1 的接近程度"""
-    H, W = vis.shape[:2]
-    bar_w = int(W * 0.28)
-    bar_h = 12
-    gap   = 8
-    x0    = 12
-    y0    = H - 2*bar_h - gap - 12
-    # 背景
-    cv2.rectangle(vis, (x0, y0), (x0 + bar_w, y0 + bar_h), (50, 50, 50), -1)
-    cv2.rectangle(vis, (x0, y0 + bar_h + gap), (x0 + bar_w, y0 + 2*bar_h + gap), (50, 50, 50), -1)
-    # 填充
-    cv2.rectangle(vis, (x0, y0), (x0 + int(bar_w * clamp01(align_score)), y0 + bar_h), (0, 220, 0), -1)
-    cv2.rectangle(vis, (x0, y0 + bar_h + gap), (x0 + int(bar_w * clamp01(range_score)), y0 + 2*bar_h + gap), (0, 180, 255), -1)
-    draw_text_cn(vis, "对齐",       (x0, y0 - 18),                 font_size=18, color=(180,180,180))
-    draw_text_cn(vis, "距离(≈1)",   (x0, y0 + bar_h + gap - 18),   font_size=18, color=(180,180,180))
 
 def polygon_center_and_area(poly):
     if poly is None or len(poly) < 3:
@@ -356,8 +184,8 @@ def hand_bbox_and_area(lms, W, H):
 
 # ======== 手势：握持(Grasp) 识别（放宽版启发式）========
 THUMB_INDEX_CLOSE = 0.34   # 放宽
-FINGERTIP_NEAR    = 0.44   # 放宽
-MIN_CURLED_COUNT  = 1      # 放宽
+FINGERTIP_NEAR = 0.44   # 放宽
+MIN_CURLED_COUNT = 1      # 放宽
 
 def detect_grasp(hand_lms, W, H):
     box, _ = hand_bbox_and_area(hand_lms, W, H)
@@ -396,111 +224,6 @@ def inner_offset_edge(mask_bin, offset_px=5, edge_dilate_px=2):
         k2 = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2*edge_dilate_px+1, 2*edge_dilate_px+1))
         edges = cv2.dilate(edges, k2, iterations=1)
     return edges  # uint8 0/255
-
-# ======== YOLO 分割：全帧或 ROI 内选择最佳 mask ========
-def find_best_mask(frame_bgr, yolo, W, H, target_cls_id, conf_thr=0.10, roi_rect=None):
-    results = yolo(frame_bgr, verbose=False)
-    best_mask = None
-    best_score = 0.0
-    if results and results[0].masks is not None:
-        r0 = results[0]
-        for mask_t, conf_t, cls_t in zip(r0.masks.data, r0.boxes.conf, r0.boxes.cls):
-            cls_id = int(cls_t.item())
-            conf_value = float(conf_t.item())
-            if target_cls_id is not None and cls_id != target_cls_id:
-                continue
-            if conf_value < conf_thr:
-                continue
-            mask_np = mask_t.detach().cpu().numpy()
-            mask_rz = cv2.resize(mask_np, (W, H), interpolation=cv2.INTER_LINEAR)
-            mask_bin = (mask_rz > 0.5).astype(np.uint8)
-
-            if roi_rect is not None:
-                x0, y0, x1, y1 = roi_rect
-                x0, y0 = max(0, x0), max(0, y0)
-                x1, y1 = min(W-1, x1), min(H-1, y1)
-                roi = np.zeros_like(mask_bin, dtype=np.uint8)
-                roi[y0:y1+1, x0:x1+1] = 1
-                overlap = (mask_bin & roi).sum()
-                score = float(overlap)
-            else:
-                score = float(mask_bin.sum())
-
-            if score > best_score:
-                best_score = score
-                best_mask = mask_bin
-    return best_mask
-
-# ======== 工程化：测距箭头（端点定位线 + 箭头 + 像素值）========
-def draw_measure_arrow(img, p1, p2, txt=None):
-    p1 = (int(p1[0]), int(p1[1]))
-    p2 = (int(p2[0]), int(p2[1]))
-    # 端点定位线
-    def end_cap(pt, size=8, color=(255,255,255), t=1):
-        x, y = pt
-        cv2.line(img, (x - size, y), (x + size, y), color, t, cv2.LINE_AA)
-        cv2.line(img, (x, y - size), (x, y + size), color, t, cv2.LINE_AA)
-    end_cap(p1, size=7, color=(255,255,255), t=1)
-    end_cap(p2, size=7, color=(255,255,255), t=1)
-    # 箭头
-    cv2.arrowedLine(img, p1, p2, (255,255,255), 2, cv2.LINE_AA, tipLength=0.18)
-    # 文本
-    if txt is None:
-        d = int(np.hypot(p2[0]-p1[0], p2[1]-p1[1]))
-        txt = f"{d}px"
-    mid = ((p1[0]+p2[0])//2, (p1[1]+p2[1])//2)
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    fs, th = 0.6, 2
-    (tw, th_text), _ = cv2.getTextSize(txt, font, fs, th)
-    pad = 4
-    x0 = mid[0] - tw//2 - pad
-    y0 = mid[1] - th_text - 6
-    x1 = mid[0] + tw//2 + pad
-    y1 = mid[1] + 6
-    cv2.rectangle(img, (x0, y0), (x1, y1), (32,32,32), -1)
-    cv2.putText(img, txt, (x0+pad, y1-6), font, fs, (255,255,255), th, cv2.LINE_AA)
-
-# 添加绘制虚线的函数
-def draw_dashed_line(img, pt1, pt2, color=(255, 255, 255), thickness=2, dash_length=10, gap_length=5):
-    """绘制虚线"""
-    pt1 = np.array(pt1, dtype=np.float32)
-    pt2 = np.array(pt2, dtype=np.float32)
-    line_vec = pt2 - pt1
-    line_len = np.linalg.norm(line_vec)
-    if line_len < 1:
-        return
-    
-    line_vec = line_vec / line_len  # 单位向量
-    
-    # 绘制虚线段
-    current_pos = 0
-    while current_pos < line_len:
-        start_pos = current_pos
-        end_pos = min(current_pos + dash_length, line_len)
-        
-        start_pt = pt1 + line_vec * start_pos
-        end_pt = pt1 + line_vec * end_pos
-        
-        cv2.line(img, tuple(start_pt.astype(int)), tuple(end_pt.astype(int)), color, thickness)
-        
-        current_pos += dash_length + gap_length
-
-# 添加绘制手部轮廓的函数
-def draw_hand_contour(img, hand_lms, W, H, color=(255, 255, 255), thickness=1):
-    """绘制手部landmarks的凸包轮廓"""
-    # 获取所有手部关键点
-    points = []
-    for lm in hand_lms:
-        x = int(lm.x * W)
-        y = int(lm.y * H)
-        points.append([x, y])
-    
-    if len(points) > 3:
-        points = np.array(points, dtype=np.int32)
-        # 计算凸包
-        hull = cv2.convexHull(points)
-        # 绘制凸包轮廓
-        cv2.polylines(img, [hull], True, color, thickness)
 
 # 检测手和物体是否接触
 def check_hand_object_contact(hand_box, poly, overlap_threshold=0.15):
@@ -596,18 +319,6 @@ def get_guidance_direction(hand_center, object_center, hand_area, object_area, h
         else:
             return "保持", None
 
-# 播放音频的函数
-def play_guidance_audio(direction):
-    """播放方向引导音频"""
-    # 直接调用新的音频播放函数
-    play_audio_threadsafe(direction)
-    # 同步更新底部按钮的指令文本
-    try:
-        if isinstance(direction, str) and direction.strip():
-            set_current_command(direction.strip())
-    except Exception:
-        pass
-
 # 添加居中判断函数
 def get_center_guidance(object_center, frame_center, threshold=30):
     """
@@ -634,225 +345,202 @@ def get_center_guidance(object_center, frame_center, threshold=30):
     else:
         return "向上" if dy > 0 else "向下", False  # 对调了
 
-def main(headless: bool = False, prompt_name: str = None, stop_event=None):
+# ========= 光流（LK）与特征点 =========
+LK_PARAMS = dict(winSize=(21, 21),
+                 maxLevel=3,
+                 criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 12, 0.03))
+FEATURE_PARAMS = dict(maxCorners=600,
+                      qualityLevel=0.001,
+                      minDistance=5,
+                      blockSize=7)
 
-    # OpenCV 优化
-    try:
-        import cv2
-        cv2.setUseOptimized(True)
-        cv2.setNumThreads(2)   # 视 CPU 核心数而定；树莓派类设备可设 1
-    except Exception:
-        pass
-
-
-
-
-    # 如果传入了 prompt_name，使用它替换全局的 PROMPT_NAME
-    global PROMPT_NAME
-    if prompt_name:
-        PROMPT_NAME = prompt_name
-        print(f"[YOLOMEDIA] Using dynamic prompt: {PROMPT_NAME}")
+class ObjectSearchServer:
+    """
+    物品查找服务器 - 处理ESP32视频流，提供REST API接口
+    """
     
-    speaker = Speaker(ENABLE_TTS)
-    last_tts_ts = 0.0
-    MODE = "SEGMENT"  # 模式：SEGMENT -> FLASH -> CENTER_GUIDE -> TRACK
-    colors = Colors()
-
-    FRAME_IDX    = 0
-    last_mask    = None      # 上一帧"目标掩膜"（用于 IoU 降噪）
-    flow_mask    = None      # 光流外推得到的掩膜（你现有代码里会更新它）
-    flow_grace   = 0         # YOLOE 丢检后，允许光流顶住的计数
-    last_seen_ts = 0.0       # 最近一次 YOLOE 成功检测的时间戳
-    locked_id    = None      # （可选）若你在 tracker 里记录了 id，可在下面选择相同 id
-    # 刷新/容错参数（可按需微调）
-    REDETECT_EVERY = 5       # 每 5 帧强制"信任 YOLOE 一次"
-    FLOW_GRACE_MAX = 8       # YOLOE 连续丢检时，光流最多顶 8 帧
-    IOU_MIN_KEEP   = 0.20    # 新/旧掩膜 IoU 太低时，用平滑合成，避免闪烁
-
-
-
-    print("[INIT] 加载 YOLO 模型...")
-    # NOTE: shoppingbest 不再用于找东西流程；如其他模式仍需，可保留 yolo = YOLO(...) 但不在本流程使用
-    # yolo = YOLO(YOLO_MODEL_PATH)
-
-    # —— 直接启用 YOLOE 文本提示后端（不再先查 shoppingbest）——
-    use_yoloe = False
-    yoloe_backend = None
-    if _YOLOE_READY:
+    def __init__(self, prompt_name: str = None, config: Dict[str, Any] = None):
+        """
+        初始化服务器
+        
+        Args:
+            prompt_name: 目标物体提示词
+            config: 配置参数
+        """
+        # 配置参数
+        self.config = config or {}
+        self.prompt_name = prompt_name or PROMPT_NAME
+        
+        # 状态变量
+        self.running = False
+        self.processing_thread = None
+        self.stop_event = threading.Event()
+        
+        # 处理状态
+        self.MODE = "SEGMENT"
+        self.FRAME_IDX = 0
+        self.last_mask = None
+        self.flow_mask = None
+        self.flow_grace = 0
+        self.last_seen_ts = 0.0
+        self.locked_id = None
+        
+        # 自动锁定相关
+        self.auto_lock_start_time = None
+        self.auto_lock_delay = 1.0
+        self.last_detected_mask = None
+        
+        # 闪烁动画相关
+        self.flash_start_time = None
+        self.flash_duration = 1.0
+        self.flash_mask = None
+        
+        # 居中引导相关
+        self.center_guide_start = None
+        self.center_reached = False
+        self.last_center_guide_time = 0
+        
+        # 光流缓存
+        self.old_gray = None
+        self.p0 = None
+        self.track_frame_count = 0
+        self.last_poly_box = None
+        
+        # 背景参考点
+        self.background_points = None
+        self.old_background_gray = None
+        
+        # 引导相关
+        self.last_guidance_time = 0
+        self.last_guidance_direction = None
+        
+        # 模型后端
+        self.use_yoloe = False
+        self.yoloe_backend = None
+        self.landmarker = None
+        
+        # FPS计算
+        self.fps_hist = []
+        
+        logger.info(f"ObjectSearchServer initialized with prompt: {self.prompt_name}")
+    
+    def initialize_models(self):
+        """初始化模型"""
         try:
-            yoloe_backend = YoloEBackend()                  # 可用 YOLOE_MODEL_PATH 环境变量指定模型
-            yoloe_backend.set_text_classes([PROMPT_NAME])   # 文本类别
-            use_yoloe = True
-            print(f"[DETECTOR] YOLOE text-prompt backend enabled for: {PROMPT_NAME}", flush=True)
-        except Exception as e:
-            print(f"[DETECTOR] YOLOE init failed: {e}", flush=True)
-    else:
-        print("[DETECTOR] YOLOE backend not ready (import failed)", flush=True)
-
-    # 类名映射（YOLOE 模式下简化）
-    if use_yoloe:
-        # YOLOE 模式下，只有一个目标类
-        id_to_name = {0: PROMPT_NAME}
-        name_to_id = {norm_name(PROMPT_NAME): 0}
-        target_cls_id = 0
-    else:
-        # 如果将来需要支持传统 YOLO，可以在这里初始化
-        id_to_name = {}
-        name_to_id = {}
-        target_cls_id = None
-
-    # 目标类已在上面的 YOLOE 模式中设置
-
-    print(f"[CLASS] target id={target_cls_id}, name={id_to_name.get(target_cls_id, 'N/A')}")
-    print(f"[阈值] conf >= {CONF_THRESHOLD:.2f}")
-
-    # Hand Landmarker
-    print("[INIT] 初始化 Hand Landmarker...")
-    base = BaseOptions(model_asset_path=HAND_TASK_PATH)
-    hand_options = HandLandmarkerOptions(
-        base_options=base,
-        running_mode=VisionRunningMode.LIVE_STREAM,
-        num_hands=1,
-        min_hand_detection_confidence=0.40,
-        min_hand_presence_confidence=0.50,
-        min_tracking_confidence=0.70,
-        result_callback=on_result
-    )
-    landmarker = HandLandmarker.create_from_options(hand_options)
-
-    W = None
-    H = None
-    print("[Bridge] 等待 ESP32 画面 ...")
-
-    # [headless] 仅在非 headless 时创建窗口（原逻辑保留，外层加判断）
-    if not headless:
-        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-
-    # 光流缓存
-    old_gray = None
-    p0 = None
-    lock_edge_debug = None     # 调试可视化：内边界
-    track_frame_count = 0      # 控制周边监控频率
-    last_poly_box = None       # 当前多边形外接矩形
-
-    fps_hist = []
-    
-    # 添加自动锁定相关变量
-    auto_lock_start_time = None  # 开始检测到物体的时间
-    auto_lock_delay = 1.0        # 1秒后自动锁定
-    last_detected_mask = None    # 最后检测到的mask
-    
-    # 添加闪烁动画相关变量
-    flash_start_time = None      # 闪烁开始时间
-    flash_duration = 1.0         # 闪烁持续时间（秒）
-    flash_frequency = 1          # 闪烁频率（Hz） - 只闪一次
-    flash_mask = None            # 用于闪烁的mask
-    flash_color = (0, 255, 255)  # 闪烁颜色（黄色）
-
-    # 添加引导相关变量
-    last_guidance_time = 0
-    last_guidance_direction = None
-
-    # 添加居中引导相关变量
-    center_guide_mask = None      # 用于居中引导的mask
-    center_guide_start = None     # 居中引导开始时间
-    center_threshold = 30         # 居中判定阈值（像素）
-    last_center_guide_time = 0   # 上次居中引导语音时间
-    center_reached = False        # 是否已经到达中心
-
-    # 添加抓取跟踪相关变量
-    grasp_tracking_frames = []  # 存储最近的手和物体位置
-    grasp_tracking_duration = 1.0  # 需要持续1秒
-    grasp_movement_threshold = 10  # 最小移动像素阈值（提高阈值）
-    grasp_detected = False  # 是否已经检测到抓取
-    grasp_start_time = None  # 开始检测到协同移动的时间
-    
-    # 背景参考点（用于检测相机移动） - 移到这里初始化
-    background_points = None
-    old_background_gray = None
-
-    try:
-        while True:
-            # 检查停止事件
-            if stop_event and stop_event.is_set():
-                print("[YOLOMEDIA] Stop event detected, exiting...")
-                break
-                
-            frame = bridge_io.wait_raw_bgr(timeout_sec=0.5)
-            if frame is None:
-                # 没取到帧就继续等（ESP32还没连上或暂时无新帧）
-                # [headless] 给出 1ms 让出调度，避免空转
-                if headless:
-                    cv2.waitKey(1)
-                continue
+            # 初始化YOLOE后端
+            if _YOLOE_READY:
+                self.yoloe_backend = YoloEBackend()
+                self.yoloe_backend.set_text_classes([self.prompt_name])
+                self.use_yoloe = True
+                logger.info(f"YOLOE text-prompt backend enabled for: {self.prompt_name}")
+            else:
+                logger.warning("YOLOE backend not available")
             
-            # 每帧重置 UI 文字叠加到左下角
-            H, W = frame.shape[:2]
-            ui_reset_overlay(H)
+            # 初始化MediaPipe Hand Landmarker
+            base = BaseOptions(model_asset_path=HAND_TASK_PATH)
+            hand_options = HandLandmarkerOptions(
+                base_options=base,
+                running_mode=VisionRunningMode.LIVE_STREAM,
+                num_hands=1,
+                min_hand_detection_confidence=0.40,
+                min_hand_presence_confidence=0.50,
+                min_tracking_confidence=0.70,
+                result_callback=on_result
+            )
+            self.landmarker = HandLandmarker.create_from_options(hand_options)
+            
+            logger.info("Models initialized successfully")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize models: {e}")
+            return False
+    
+    def process_frame(self, frame: np.ndarray) -> Dict[str, Any]:
+        """
+        处理一帧图像
+        
+        Args:
+            frame: 输入图像帧
+            
+        Returns:
+            处理结果字典
+        """
+        # 调整帧大小到目标分辨率
+        if frame.shape[1] != INPUT_W or frame.shape[0] != INPUT_H:
+            frame = cv2.resize(frame, (INPUT_W, INPUT_H))
+        
+        H, W = frame.shape[:2]
+        t_now = time.time()
+        
+        # 抽帧 + 降采样（人手识别）
+        if self.FRAME_IDX % HAND_FPS_DIV == 0:
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if HAND_DOWNSCALE and HAND_DOWNSCALE != 1.0:
+                small = cv2.resize(rgb, None, fx=HAND_DOWNSCALE, fy=HAND_DOWNSCALE, interpolation=cv2.INTER_AREA)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=small)
+            else:
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            self.landmarker.detect_async(mp_image, int(t_now * 1000))
+        
+        # 收集检测结果
+        detection_result = {
+            "timestamp": t_now,
+            "frame_id": self.FRAME_IDX,
+            "mode": self.MODE,
+            "hand_detected": False,
+            "object_detected": False,
+            "guidance": None,
+            "metrics": {},
+            "polygon": None,
+            "status": "idle",
+            "processing_time_ms": 0
+        }
+        
+        start_time = time.time()
+        
+        # 取手心、手框、握持（放宽版）
+        hand_center = None
+        hand_area = None
+        hand_box = None
+        grasp_now = False
+        grasp_score = 0.0
+        
+        if _last_result is not None:
+            res, _ = _last_result
+            if res.hand_landmarks and len(res.hand_landmarks) > 0:
+                l0 = res.hand_landmarks[0]
+                
+                # 获取手部信息
+                xs = [p.x * W for p in l0]
+                ys = [p.y * H for p in l0]
+                hand_center = (float(sum(xs)/len(xs)), float(sum(ys)/len(ys)))
+                hand_box, hand_area = hand_bbox_and_area(l0, W, H)
+                grasp_now, grasp_score = detect_grasp(l0, W, H)
+                
+                detection_result["hand_detected"] = True
+                detection_result["hand_center"] = hand_center
+                detection_result["hand_box"] = hand_box
+                detection_result["grasp_score"] = grasp_score
+                detection_result["grasp_now"] = grasp_now
+        
+        if self.MODE == "SEGMENT":
+            self.FRAME_IDX += 1
+            candidate_masks = []
+            detected_object = False
 
-            vis = frame.copy()
-            t_now = time.time()
+            if self.use_yoloe and self.yoloe_backend is not None:
+                det = self.yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=640, persist=True)
+                H, W = frame.shape[:2]
 
-            # 抽帧 + 降采样（人手识别）
-            if FRAME_IDX % HAND_FPS_DIV == 0:
-                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                if HAND_DOWNSCALE and HAND_DOWNSCALE != 1.0:
-                    small = cv2.resize(rgb, None, fx=HAND_DOWNSCALE, fy=HAND_DOWNSCALE, interpolation=cv2.INTER_AREA)
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=small)
-                else:
-                    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-                landmarker.detect_async(mp_image, int(t_now * 1000))
-            # 否则跳过，复用上一次 _last_result；Landmarker 会自己做 tracking
-
-
-            # 取手心、手框、握持（放宽版）
-            hand_center = None
-            hand_area = None
-            hand_box = None
-            grasp_now = False
-            grasp_score = 0.0
-            if _last_result is not None:
-                res, _ = _last_result
-                if res.hand_landmarks and len(res.hand_landmarks) > 0:
-                    l0 = res.hand_landmarks[0]
-                    
-                    # 绘制手部骨骼
-                    draw_hands_mono(vis, l0, color=(0, 255, 255), r=2, t=2)
-                    
-                    # 绘制手部轮廓（替代矩形框）
-                    draw_hand_contour(vis, l0, W, H, color=(255, 255, 255), thickness=1)
-                    
-                    xs = [p.x * W for p in l0]
-                    ys = [p.y * H for p in l0]
-                    hand_center = (float(sum(xs)/len(xs)), float(sum(ys)/len(ys)))
-                    hand_box, hand_area = hand_bbox_and_area(l0, W, H)
-                    # 注释掉矩形框绘制
-                    # if hand_box:
-                    #     x0, y0, w0, h0 = hand_box
-                    #     cv2.rectangle(vis, (x0, y0), (x0+w0, y0+h0), (0,255,255), 1)
-                    grasp_now, grasp_score = detect_grasp(l0, W, H)
-                    draw_text_cn(vis, f"握持评分: {grasp_score:.2f}", (10, 70), font_size=18, color=(0, 180, 255))
-                    
-
-            if MODE == "SEGMENT":
-                # —— 仅 YOLOE：每帧文本提示分割 + 取最大目标（删掉 shoppingbest 与重复 YOLOE 段）——
-                FRAME_IDX += 1
-                candidate_masks = []
-                detected_object = False
-
-                if use_yoloe and yoloe_backend is not None:
-                    # 每帧都跑；persist=True 便于维持目标 ID
-                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=640, persist=True)
-                    H, W = frame.shape[:2]
-
-                    # 选一个掩膜：优先与 locked_id 相同；否则面积最大
-                    chosen_idx = None
-                    if det["masks"]:
-                        if locked_id is not None and det["ids"] and (locked_id in det["ids"]):
-                            chosen_idx = det["ids"].index(locked_id)
-                        else:
-                            areas = [int(m.sum()) for m in det["masks"]]
-                            chosen_idx = int(np.argmax(areas))
+                # 选一个掩膜：优先与 locked_id 相同；否则面积最大
+                chosen_idx = None
+                if det["masks"]:
+                    if self.locked_id is not None and det["ids"] and (self.locked_id in det["ids"]):
+                        chosen_idx = det["ids"].index(self.locked_id)
+                    else:
+                        areas = [int(m.sum()) for m in det["masks"]]
+                        chosen_idx = int(np.argmax(areas))
 
                     if chosen_idx is not None:
                         m = det["masks"][chosen_idx]
@@ -863,503 +551,238 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                         candidate_masks.append({
                             "mask": mask_bin,
                             "area": int(mask_bin.sum()),
-                            "name": PROMPT_NAME,
+                            "name": self.prompt_name,
                             "cls_id": 0,
                             "conf": 0.99,
                         })
                         detected_object = True
 
-                        # 简单可视化（半透明叠层 + 轮廓），不影响你后面的逻辑
-                        colored = np.zeros_like(frame, dtype=np.uint8)
-                        colored[mask_bin == 1] = (0, 255, 255)
-                        vis = cv2.addWeighted(vis, 1.0, colored, MASK_ALPHA, 0)
-                        contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                        if contours:
-                            # 选择最大轮廓并进行适度平滑
-                            largest_contour = max(contours, key=cv2.contourArea)
-                            # 使用Douglas-Peucker算法适度简化，保持更多细节
-                            epsilon = CONTOUR_EPSILON_FACTOR * cv2.arcLength(largest_contour, True)  # 更小的epsilon保留更多细节
-                            smoothed_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
-                            cv2.drawContours(vis, [smoothed_contour], -1, (0, 255, 255), STROKE_WIDTH)
-
                         # 记录 id，减少目标跳变
                         if det["ids"] and len(det["ids"]) > chosen_idx and det["ids"][chosen_idx] is not None:
-                            locked_id = int(det["ids"][chosen_idx])
+                            self.locked_id = int(det["ids"][chosen_idx])
 
-                else:
-                    # YOLOE 未就绪：提示并保持原画面（不阻塞前端）
-                    draw_text_cn(vis, "YOLOE 未就绪，显示原始画面", (10, 100), font_size=22, color=(0, 215, 255))
-
-                # 选择面积最大的mask  ←—— 这一行下面开始保留你的原代码
-
-                # 选择面积最大的mask
-                if candidate_masks:
-                    # 按面积降序排序
-                    candidate_masks.sort(key=lambda x: x['area'], reverse=True)
-                    largest_mask_info = candidate_masks[0]
-                    last_detected_mask = largest_mask_info['mask']
-                    
-                    # 可选：在最大的物体上添加特殊标记
-                    contours, _ = cv2.findContours(last_detected_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                    if contours:
-                        # 找到最大轮廓的中心
-                        M = cv2.moments(contours[0])
-                        if M["m00"] != 0:
-                            cx = int(M["m10"] / M["m00"])
-                            cy = int(M["m01"] / M["m00"])
-                            # 在最大物体中心画一个圆圈标记
-                            cv2.circle(vis, (cx, cy), 8, (0, 255, 0), 2)
-                            cv2.circle(vis, (cx, cy), 12, (0, 255, 0), 1)
-                            # 目标标签：保持就地标注
-                            draw_text_cn(vis, "目标", (cx + 15, cy - 5), font_size=16, color=FRONTEND_COLORS["ok"], ui_hint=False)
-                    
-                    # 显示检测信息
-                    if len(candidate_masks) > 1:
-                        draw_text_cn(vis, f"检测到{len(candidate_masks)}个物体，选择最大的（面积: {largest_mask_info['area']}）", 
-                                   (10, H - 30), font_size=16, color=(255, 255, 0))
+            # 选择面积最大的mask
+            if candidate_masks:
+                candidate_masks.sort(key=lambda x: x['area'], reverse=True)
+                largest_mask_info = candidate_masks[0]
+                self.last_detected_mask = largest_mask_info['mask']
                 
-                # 自动锁定逻辑
-                if detected_object and last_detected_mask is not None:
-                    if auto_lock_start_time is None:
-                        auto_lock_start_time = t_now
-                        print(f"[AUTO] 检测到物体，选择最大的（面积: {np.sum(last_detected_mask)}），开始倒计时...")
-                        #play_guidance_audio("检测到物体")  # 添加这行
-                    
-                    elapsed = t_now - auto_lock_start_time
-                    remaining = auto_lock_delay - elapsed
+                detection_result["object_detected"] = True
+                detection_result["object_area"] = int(np.sum(self.last_detected_mask))
+                detection_result["object_count"] = len(candidate_masks)
+                detection_result["object_confidence"] = largest_mask_info["conf"]
+            
+            # 自动锁定逻辑
+            if detected_object and self.last_detected_mask is not None:
+                if self.auto_lock_start_time is None:
+                    self.auto_lock_start_time = t_now
+                    detection_result["status"] = "detected"
+                    detection_result["guidance"] = "检测到物体，准备锁定"
+                else:
+                    elapsed = t_now - self.auto_lock_start_time
+                    remaining = self.auto_lock_delay - elapsed
                     
                     if remaining > 0:
-                        # 显示倒计时（移动到左下角，前端风格）
-                        draw_text_cn(vis, f"检测到物体，{remaining:.1f}秒后自动锁定", (10, 100), font_size=16, color=FRONTEND_COLORS["text"], stroke=(0,0,0))
-                        
-                        # 绘制锁定框 - 使用虚线框表示正在准备锁定
-                        if last_detected_mask is not None:
-                            contours, _ = cv2.findContours(last_detected_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                            if contours:
-                                # 找到最大轮廓
-                                largest_contour = max(contours, key=cv2.contourArea)
-                                # 简化轮廓
-                                epsilon = CONTOUR_EPSILON_FACTOR * cv2.arcLength(largest_contour, True)
-                                smoothed_contour = cv2.approxPolyDP(largest_contour, epsilon, True)
-                                
-                                # 根据倒计时进度改变颜色亮度
-                                progress = 1.0 - (remaining / auto_lock_delay)
-                                color_intensity = int(100 + 155 * progress)  # 从100到255
-                                lock_color = (0, color_intensity, color_intensity)  # 黄色渐亮
-                                
-                                # 绘制虚线轮廓
-                                pts = smoothed_contour.reshape(-1, 2)
-                                for i in range(len(pts)):
-                                    pt1 = tuple(pts[i])
-                                    pt2 = tuple(pts[(i + 1) % len(pts)])
-                                    # 使用虚线效果（通过绘制短线段）
-                                    draw_dashed_line(vis, pt1, pt2, color=lock_color, thickness=3, 
-                                                   dash_length=15, gap_length=8)
+                        detection_result["status"] = f"locking_{remaining:.1f}s"
+                        detection_result["guidance"] = f"检测到物体，{remaining:.1f}秒后自动锁定"
                     else:
                         # 进入闪烁模式
-                        print("[AUTO] 进入闪烁动画模式")
-                        MODE = "FLASH"
-                        flash_start_time = t_now
-                        flash_mask = last_detected_mask.copy()
-                        auto_lock_start_time = None
-                        play_guidance_audio("检测到物体") 
-                else:
-                    # 没有检测到物体，重置计时器
-                    if auto_lock_start_time is not None:
-                        print("[AUTO] 物体丢失，重置倒计时")
-                    auto_lock_start_time = None
-                    last_detected_mask = None
-                    draw_text_cn(vis, "分割中... 等待检测到物体", (10, 100), font_size=16, color=FRONTEND_COLORS["muted"])
+                        logger.info("Entering flash animation mode")
+                        self.MODE = "FLASH"
+                        self.flash_start_time = t_now
+                        self.flash_mask = self.last_detected_mask.copy()
+                        self.auto_lock_start_time = None
+                        
+                        detection_result["status"] = "flashing"
+                        detection_result["guidance"] = "检测到物体，正在锁定"
+            else:
+                # 没有检测到物体，重置计时器
+                if self.auto_lock_start_time is not None:
+                    logger.info("Object lost, resetting countdown")
+                self.auto_lock_start_time = None
+                self.last_detected_mask = None
+                detection_result["status"] = "searching"
+                detection_result["guidance"] = "正在搜索物体..."
 
-            elif MODE == "FLASH":
-                # 闪烁动画模式
-                if flash_start_time is not None and flash_mask is not None:
-                    elapsed = t_now - flash_start_time
-                    
-                    if elapsed < flash_duration:
-                        # 计算渐入渐出效果
-                        # 前0.3秒渐入，中间0.4秒保持，后0.3秒渐出
-                        if elapsed < 0.3:
-                            # 渐入阶段
-                            alpha = elapsed / 0.3 * 0.8  # 0到0.8
-                        elif elapsed < 0.7:
-                            # 保持阶段
-                            alpha = 0.8
-                        else:
-                            # 渐出阶段
-                            alpha = (1.0 - elapsed) / 0.3 * 0.8  # 0.8到0
-                        
-                        # 绘制闪烁的mask
-                        colored = np.zeros_like(frame, dtype=np.uint8)
-                        colored[flash_mask == 1] = flash_color
-                        vis = cv2.addWeighted(vis, 1.0 - alpha, colored, alpha, 0)
-                        
-                        # 绘制轮廓（固定粗细，颜色渐变）
-                        contours, _ = cv2.findContours(flash_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                        if contours:
-                            # 轮廓颜色也跟随alpha变化
-                            contour_color = tuple(int(c * (0.5 + alpha * 0.5)) for c in flash_color)
-                            cv2.drawContours(vis, contours, -1, contour_color, STROKE_WIDTH + 1)
-                        
-                        # 显示提示文字（左下角）
-                        draw_text_cn(vis, "正在锁定目标...", (10, 100), font_size=18, color=FRONTEND_COLORS["accent"]) 
-                    else:
-                        # 闪烁结束，初始化光流追踪并进入居中引导模式
-                        print("[AUTO] 闪烁结束，初始化光流追踪")
-                        edge_mask = inner_offset_edge(flash_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
-                        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                        pts = cv2.goodFeaturesToTrack(gray, mask=edge_mask, **FEATURE_PARAMS)
-                        
-                        if pts is not None and len(pts) >= 8:
-                            p0 = pts
-                            old_gray = gray
-                            MODE = "CENTER_GUIDE"
-                            lock_edge_debug = edge_mask.copy()
-                            track_frame_count = 0
-                            center_guide_start = t_now
-                            center_reached = False
-                            flash_start_time = None
-                            flash_mask = None
-                            last_detected_mask = None
-                            print(f"[LOCK] 内边界特征点数={len(p0)} → CENTER_GUIDE")
-                        else:
-                            print("[LOCK] 内边界特征点不足，返回检测模式")
-                            MODE = "SEGMENT"
-                            flash_start_time = None
-                            flash_mask = None
-                            last_detected_mask = None
-            
-            elif MODE == "CENTER_GUIDE":
-                # 居中引导模式（使用光流追踪）
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                poly_center = None
-                poly_area = 0.0
+        elif self.MODE == "FLASH":
+            # 闪烁动画模式
+            if self.flash_start_time is not None and self.flash_mask is not None:
+                elapsed = t_now - self.flash_start_time
                 
-                if old_gray is not None and p0 is not None and len(p0) >= 5:
-                    # 光流追踪
-                    p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, gray, p0, None, **LK_PARAMS)
-                    if p1 is not None and st is not None:
-                        good_new = p1[st == 1]
-                        if len(good_new) >= 5:
-                            p0 = good_new.reshape(-1, 1, 2)
-                            hull = cv2.convexHull(good_new.reshape(-1,1,2))
-                            poly = hull.reshape(-1, 2)
+                if elapsed < self.flash_duration:
+                    detection_result["status"] = f"flashing_{elapsed:.1f}s"
+                    detection_result["guidance"] = "正在锁定目标..."
+                else:
+                    # 闪烁结束，初始化光流追踪并进入居中引导模式
+                    logger.info("Flash ended, initializing optical flow")
+                    edge_mask = inner_offset_edge(self.flash_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
+                    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                    pts = cv2.goodFeaturesToTrack(gray, mask=edge_mask, **FEATURE_PARAMS)
+                    
+                    if pts is not None and len(pts) >= 8:
+                        self.p0 = pts
+                        self.old_gray = gray
+                        self.MODE = "CENTER_GUIDE"
+                        self.track_frame_count = 0
+                        self.center_guide_start = t_now
+                        self.center_reached = False
+                        self.flash_start_time = None
+                        self.flash_mask = None
+                        self.last_detected_mask = None
+                        logger.info(f"Edge feature points={len(self.p0)} → CENTER_GUIDE")
+                    else:
+                        logger.info("Edge feature points insufficient, returning to detection mode")
+                        self.MODE = "SEGMENT"
+                        self.flash_start_time = None
+                        self.flash_mask = None
+                        self.last_detected_mask = None
+        
+        elif self.MODE == "CENTER_GUIDE":
+            # 居中引导模式（使用光流追踪）
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            poly_center = None
+            poly_area = 0.0
+            
+            if self.old_gray is not None and self.p0 is not None and len(self.p0) >= 5:
+                # 光流追踪
+                p1, st, err = cv2.calcOpticalFlowPyrLK(self.old_gray, gray, self.p0, None, **LK_PARAMS)
+                if p1 is not None and st is not None:
+                    good_new = p1[st == 1]
+                    if len(good_new) >= 5:
+                        self.p0 = good_new.reshape(-1, 1, 2)
+                        hull = cv2.convexHull(good_new.reshape(-1,1,2))
+                        poly = hull.reshape(-1, 2)
+                        
+                        if len(poly) >= 3:
+                            # 多边形质心与面积
+                            poly_center, poly_area = polygon_center_and_area(poly)
                             
-                            if len(poly) >= 3:
-                                H, W = frame.shape[:2]
+                            if poly_center:
+                                object_center = (int(poly_center[0]), int(poly_center[1]))
+                                frame_center = (W // 2, H // 2)
+                                
+                                # 获取引导方向
+                                direction, is_centered = get_center_guidance(object_center, frame_center, 30)
+                                
+                                detection_result["object_detected"] = True
+                                detection_result["object_center"] = poly_center
+                                detection_result["object_area"] = poly_area
+                                detection_result["polygon"] = poly.tolist()
+                                detection_result["frame_center"] = frame_center
+                                
+                                if not self.center_reached:
+                                    if is_centered:
+                                        # 到达中心
+                                        self.center_reached = True
+                                        self.last_center_guide_time = t_now
+                                        detection_result["status"] = "centered"
+                                        detection_result["guidance"] = "物品已居中！"
+                                    else:
+                                        # 显示引导文字
+                                        detection_result["status"] = "centering"
+                                        detection_result["guidance"] = f"请将物品移到画面中心: {direction}"
+                                        
+                                        # 计算距离信息
+                                        dx = frame_center[0] - object_center[0]
+                                        dy = frame_center[1] - object_center[1]
+                                        distance = int(np.sqrt(dx**2 + dy**2))
+                                        detection_result["metrics"]["distance_to_center"] = distance
+                                        
+                                        if t_now - self.last_center_guide_time > 1.5:
+                                            self.last_center_guide_time = t_now
+                                else:
+                                    # 已经居中
+                                    detection_result["status"] = "centered_holding"
+                                    detection_result["guidance"] = "物品已成功移到中心！"
+                                    
+                                    # 等待1秒后进入手部追踪模式
+                                    if t_now - self.last_center_guide_time > 1.0:
+                                        logger.info("Entering hand tracking mode")
+                                        self.MODE = "TRACK"
+                            else:
+                                detection_result["status"] = "tracking_object"
+                                detection_result["guidance"] = "正在追踪物体..."
+                else:
+                    # 光流点数不足，尝试重新检测
+                    self.MODE = "SEGMENT"
+                    self.old_gray = None
+                    self.p0 = None
+                    logger.info("Optical flow tracking failed, returning to detection mode")
+            
+            self.old_gray = gray
 
-                                # 把当前光流多边形 rasterize 成掩膜（便于与 YOLOE 掩膜做 IoU）
-                                poly_mask = np.zeros((H, W), dtype=np.uint8)
-                                cv2.fillPoly(poly_mask, [poly.astype(np.int32)], 1)
+        elif self.MODE == "TRACK":
+            # 手部追踪模式
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            self.track_frame_count += 1
 
-                                # 降频：每3帧用 YOLOE 重新检测，其余帧依赖光流维持
-                                need_reseed = False
-                                new_det_mask = None
+            relock_done = False
+            poly_center = None
+            poly_area = 0.0
 
-                                if use_yoloe and yoloe_backend is not None and (FRAME_IDX % 3 == 0):
-                                    # 添加调试信息
-                                    if FRAME_IDX % 30 == 0:  # 每30帧打印一次
-                                        print(f"[YOLOE] 实时检测第 {FRAME_IDX} 帧")
-                                    det = yoloe_backend.segment(frame, conf=0.20, iou=0.45, imgsz=640, persist=True)
-                                    if det["masks"]:
-                                        # 取面积最大的那个
-                                        areas = [int(m.sum()) for m in det["masks"]]
-                                        j = int(np.argmax(areas))
-                                        m = det["masks"][j]
-                                        if m.shape[:2] != (H, W):
-                                            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-                                        new_det_mask = (m > 0).astype(np.uint8)
-
-                                        # 和当前光流多边形的 IoU
-                                        inter = np.logical_and(new_det_mask, poly_mask).sum()
-                                        union = np.logical_or(new_det_mask, poly_mask).sum() + 1e-6
-                                        iou   = inter / union
-
-                                        # IoU 太低，说明漂了：用 YOLOE 的掩膜重播种光流
-                                        # 降低阈值，让 YOLOE 更容易更新光流
-                                        if iou < 0.5:  # 从 IOU_MIN_KEEP (0.20) 提高到 0.5
-                                            need_reseed = True
-                                            # 用新掩膜的「内边界特征点」播种
-                                            edge_mask = inner_offset_edge(new_det_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
-                                            gray2 = gray  # 本帧灰度图已在上面算过
-                                            pts = cv2.goodFeaturesToTrack(gray2, mask=edge_mask, **FEATURE_PARAMS)
-                                            if pts is not None and len(pts) >= 8:
-                                                p0 = pts
-                                                old_gray = gray2
-                                                # 更新 last_mask，便于下游逻辑一致
-                                                last_mask = new_det_mask.copy()
-                                                last_seen_ts = time.time()
-                                                flow_grace = 0
-                                                print("[RESEED] YOLOE 低 IoU 触发重播种（已更新光流特征点）")
-
-                                # 如果这帧没重播种，但 YOLOE 有结果且与 poly 很接近，可以做一次"平滑融合"，抑制抖动
-                                if (not need_reseed) and (new_det_mask is not None):
-                                    inter = np.logical_and(new_det_mask, poly_mask).sum()
-                                    union = np.logical_or(new_det_mask, poly_mask).sum() + 1e-6
-                                    iou   = inter / union
-                                    # 降低融合阈值，让 YOLOE 结果更容易被采用
-                                    if iou < 0.95:  # 从 0.90 提高到 0.95
-                                        # 增加 YOLOE 的权重，让实时检测更明显
-                                        poly_mask = ((0.8 * new_det_mask + 0.2 * poly_mask) > 0.5).astype(np.uint8)
-                                        # 用更新后的 poly_mask 回写到可视化与引导的后续变量（如果你下游用的是 last_detected_mask/last_mask）
-                                        last_mask = poly_mask.copy()
-                                                                                # 更新多边形轮廓，让可视化实时更新
-                                        contours, _ = cv2.findContours(poly_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            if self.old_gray is not None and self.p0 is not None and len(self.p0) >= 5:
+                p1, st, err = cv2.calcOpticalFlowPyrLK(self.old_gray, gray, self.p0, None, **LK_PARAMS)
+                if p1 is not None and st is not None:
+                    good_new = p1[st == 1]
+                    if len(good_new) >= 5:
+                        self.p0 = good_new.reshape(-1, 1, 2)
+                        hull = cv2.convexHull(good_new.reshape(-1,1,2))
+                        poly = hull.reshape(-1, 2)
+                        
+                        if len(poly) >= 3:
+                            # 统一的 YOLOE 实时检测和校正（每帧）
+                            latest_det_mask = None
+                            if self.use_yoloe and self.yoloe_backend is not None:
+                                det = self.yoloe_backend.segment(frame, conf=YOLO_CORRECTION_CONF_THRESHOLD, iou=0.45, imgsz=640, persist=True)
+                                if det["masks"]:
+                                    areas = [int(m.sum()) for m in det["masks"]]
+                                    j = int(np.argmax(areas))
+                                    m = det["masks"][j]
+                                    if m.shape[:2] != (H, W):
+                                        m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
+                                    latest_det_mask = (m > 0).astype(np.uint8)
+                                    
+                                    # 和当前光流多边形的 IoU
+                                    poly_mask = np.zeros((H, W), dtype=np.uint8)
+                                    cv2.fillPoly(poly_mask, [poly.astype(np.int32)], 1)
+                                    inter = np.logical_and(latest_det_mask, poly_mask).sum()
+                                    union = np.logical_or(latest_det_mask, poly_mask).sum() + 1e-6
+                                    iou = inter / union
+                                    
+                                    # 降低IoU阈值，更积极地校正
+                                    if iou > YOLO_CORRECTION_IOU_THRESHOLD:
+                                        contours, _ = cv2.findContours(latest_det_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
                                         if contours:
-                                            # 找到最大轮廓
                                             largest_contour = max(contours, key=cv2.contourArea)
-                                            # 使用精细的轮廓处理，保留更多细节
                                             epsilon = TRACK_EPSILON_FACTOR * cv2.arcLength(largest_contour, True)
                                             poly = cv2.approxPolyDP(largest_contour, epsilon, True).reshape(-1, 2)
-                                            # 注释掉凸包处理，保留原始轮廓细节
-                                            # hull = cv2.convexHull(poly.reshape(-1,1,2))
-                                            # poly = hull.reshape(-1, 2)
-                                            # 重新计算特征点
-                                            edge_mask = inner_offset_edge(poly_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
+                                            
+                                            edge_mask = inner_offset_edge(latest_det_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
                                             pts = cv2.goodFeaturesToTrack(gray, mask=edge_mask, **FEATURE_PARAMS)
                                             if pts is not None and len(pts) >= 5:
-                                                p0 = pts
-
-                                # 绘制追踪的多边形 - 使用更粗的线条
-                                cv2.polylines(vis, [poly.astype(np.int32)], isClosed=True, color=(0,255,255), thickness=STROKE_WIDTH)
-                                
-                                # 计算多边形中心
-                                poly_center, poly_area = polygon_center_and_area(poly)
-                                
-                                if poly_center:
-                                    object_center = (int(poly_center[0]), int(poly_center[1]))
-                                    
-                                    # 画面中心
-                                    frame_center = (W // 2, H // 2)
-                                    
-                                    # 绘制物品中心点
-                                    cv2.circle(vis, object_center, 8, (0, 255, 0), -1)
-                                    cv2.circle(vis, object_center, 12, (0, 255, 0), 2)
-                                    
-                                    # 绘制画面中心十字
-                                    cv2.line(vis, (frame_center[0] - 20, frame_center[1]), 
-                                            (frame_center[0] + 20, frame_center[1]), (255, 255, 255), 2)
-                                    cv2.line(vis, (frame_center[0], frame_center[1] - 20), 
-                                            (frame_center[0], frame_center[1] + 20), (255, 255, 255), 2)
-                                    
-                                    # 绘制引导虚线
-                                    draw_dashed_line(vis, object_center, frame_center, 
-                                                   color=(255, 255, 0), thickness=2, 
-                                                   dash_length=10, gap_length=5)
-                                    
-                                    # 获取引导方向
-                                    direction, is_centered = get_center_guidance(object_center, frame_center, center_threshold)
-                                    
-                                    if not center_reached:
-                                        if is_centered:
-                                            # 到达中心，播放OK音效
-                                            center_reached = True
-                                            last_center_guide_time = t_now
-                                            play_guidance_audio("OK")
-                                            try:
-                                                bridge_io.send_ui_final("✓ 物品已居中！")
-                                            except Exception:
-                                                pass
-                                            draw_text_cn(vis, "✓ 物品已居中！", (10, 60), font_size=18, color=FRONTEND_COLORS["ok"]) 
-                                        else:
-                                            # 显示引导文字
-                                            msg = f"请将物品移到画面中心: {direction}"
-                                            try:
-                                                # 节流：每次语音播报也推一次final
-                                                if t_now - last_center_guide_time > GUIDANCE_INTERVAL_SEC:
-                                                    bridge_io.send_ui_final(msg)
-                                            except Exception:
-                                                pass
-                                            draw_text_cn(vis, msg, 
-                                                       (10, 40), font_size=18, color=FRONTEND_COLORS["text"])
-                                            
-                                            # 显示距离信息
-                                            dx = frame_center[0] - object_center[0]
-                                            dy = frame_center[1] - object_center[1]
-                                            distance = int(np.sqrt(dx**2 + dy**2))
-                                            draw_text_cn(vis, f"距离: {distance}px", 
-                                                       (10, 60), font_size=16, color=FRONTEND_COLORS["muted"])
-                                            
-                                            # 播放语音引导
-                                            if t_now - last_center_guide_time > GUIDANCE_INTERVAL_SEC:
-                                                play_guidance_audio(direction)
-                                                last_center_guide_time = t_now
-                                    else:
-                                        # 已经居中，显示成功信息
-                                        try:
-                                            bridge_io.send_ui_final("✓ 物品已成功移到中心！")
-                                        except Exception:
-                                            pass
-                                        draw_text_cn(vis, "✓ 物品已成功移到中心！", 
-                                                   (10, 60), font_size=18, color=FRONTEND_COLORS["ok"])
-                                        
-                                        # 等待1秒后进入手部追踪模式
-                                        if t_now - last_center_guide_time > 1.0:
-                                            print("[CENTER] 进入手部追踪模式")
-                                            try:
-                                                bridge_io.send_ui_final("进入手部追踪模式")
-                                            except Exception:
-                                                pass
-                                            MODE = "TRACK"
-                                            # 保持当前的光流追踪状态
-                                else:
-                                    # 多边形中心计算失败，显示警告
-                                    draw_text_cn(vis, "正在追踪物体...", (10, 100), font_size=20, color=(255, 255, 0))
-                        else:
-                            # 光流点数不足，尝试重新检测
-                            MODE = "SEGMENT"
-                            old_gray = None
-                            p0 = None
-                            print("[CENTER] 光流追踪失败，返回检测模式")
-                
-                old_gray = gray
-
-            else:  # MODE == "TRACK"
-                # 手部追踪模式（原有逻辑保持不变）
-                align_score = 0.0
-                range_score = 0.0
-                ratio = None
-
-                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                track_frame_count += 1
-
-                relock_done = False
-                poly_center = None
-                poly_area = 0.0
-
-                # 初始化camera_movement为默认值
-                camera_movement = np.array([0.0, 0.0])
-                
-                # 初始化或更新背景参考点（在物体多边形外部取点）
-                if background_points is None or track_frame_count % 30 == 0:
-                    # 在画面四角取一些背景特征点
-                    mask_for_bg = np.ones((H, W), dtype=np.uint8) * 255
-                    if last_poly_box:
-                        x, y, w, h = last_poly_box
-                        # 扩大区域，排除物体和手
-                        expand = 100
-                        x1 = max(0, x - expand)
-                        y1 = max(0, y - expand)
-                        x2 = min(W, x + w + expand)
-                        y2 = min(H, y + h + expand)
-                        mask_for_bg[y1:y2, x1:x2] = 0
-                    
-                    # 在背景区域提取特征点
-                    try:
-                        bg_pts = cv2.goodFeaturesToTrack(gray, maxCorners=20, 
-                                                       qualityLevel=0.1, 
-                                                       minDistance=30, 
-                                                       mask=mask_for_bg)
-                        if bg_pts is not None and len(bg_pts) >= 5:
-                            background_points = bg_pts
-                            old_background_gray = gray.copy()
-                    except Exception as e:
-                        #print(f"[TRACK] 背景特征点提取失败: {e}")
-                        background_points = None
-                
-                # 计算背景移动（相机移动）
-                if old_background_gray is not None and background_points is not None and len(background_points) > 0:
-                    try:
-                        bg_p1, bg_st, _ = cv2.calcOpticalFlowPyrLK(
-                            old_background_gray, gray, background_points, None, **LK_PARAMS
-                        )
-                        if bg_p1 is not None and bg_st is not None:
-                            good_bg_old = background_points[bg_st == 1]
-                            good_bg_new = bg_p1[bg_st == 1]
-                            if len(good_bg_new) >= 3 and len(good_bg_old) >= 3:
-                                # 计算背景的平均移动
-                                bg_movement = np.mean(good_bg_new - good_bg_old, axis=0)
-                                camera_movement = bg_movement.reshape(2)
-                                background_points = good_bg_new.reshape(-1, 1, 2)
-                                old_background_gray = gray.copy()
-                    except Exception as e:
-                        print(f"[TRACK] 背景光流计算失败: {e}")
-                        camera_movement = np.array([0.0, 0.0])
-
-                if old_gray is not None and p0 is not None and len(p0) >= 5:
-                    p1, st, err = cv2.calcOpticalFlowPyrLK(old_gray, gray, p0, None, **LK_PARAMS)
-                    if p1 is not None and st is not None:
-                        good_new = p1[st == 1]
-                        if len(good_new) >= 5:
-                            p0 = good_new.reshape(-1, 1, 2)
-                            hull = cv2.convexHull(good_new.reshape(-1,1,2))
-                            poly = hull.reshape(-1, 2)
+                                                self.p0 = pts
                             
-                            if len(poly) >= 3:
-                                # 统一的 YOLOE 实时检测和校正（每帧）
-                                latest_det_mask = None
-                                if use_yoloe and yoloe_backend is not None:
-                                    # 添加调试信息
-                                    if track_frame_count % 30 == 0:  # 每30帧打印一次
-                                        print(f"[YOLOE] TRACK模式实时检测第 {track_frame_count} 帧")
-                                    
-                                    # YOLOE 实时检测（统一调用，避免重复）
-                                    det = yoloe_backend.segment(frame, conf=YOLO_CORRECTION_CONF_THRESHOLD, iou=0.45, imgsz=640, persist=True)
-                                    if det["masks"]:
-                                        # 取面积最大的那个
-                                        areas = [int(m.sum()) for m in det["masks"]]
-                                        j = int(np.argmax(areas))
-                                        m = det["masks"][j]
-                                        if m.shape[:2] != (H, W):
-                                            m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-                                        latest_det_mask = (m > 0).astype(np.uint8)
-                                        
-                                        # 和当前光流多边形的 IoU
-                                        poly_mask = np.zeros((H, W), dtype=np.uint8)
-                                        cv2.fillPoly(poly_mask, [poly.astype(np.int32)], 1)
-                                        inter = np.logical_and(latest_det_mask, poly_mask).sum()
-                                        union = np.logical_or(latest_det_mask, poly_mask).sum() + 1e-6
-                                        iou = inter / union
-                                        
-                                        # 降低IoU阈值，更积极地校正
-                                        if iou > YOLO_CORRECTION_IOU_THRESHOLD:  # 使用可配置阈值
-                                            # 用 YOLOE 结果更新多边形
-                                            contours, _ = cv2.findContours(latest_det_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-                                            if contours:
-                                                largest_contour = max(contours, key=cv2.contourArea)
-                                                # 使用更精细的轮廓处理，减少过度简化
-                                                epsilon = TRACK_EPSILON_FACTOR * cv2.arcLength(largest_contour, True)
-                                                poly = cv2.approxPolyDP(largest_contour, epsilon, True).reshape(-1, 2)
-                                                
-                                                # 更新光流特征点
-                                                edge_mask = inner_offset_edge(latest_det_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
-                                                pts = cv2.goodFeaturesToTrack(gray, mask=edge_mask, **FEATURE_PARAMS)
-                                                if pts is not None and len(pts) >= 5:
-                                                    p0 = pts
-                                                    #print(f"[TRACK] YOLOE 实时校正，IoU: {iou:.3f}")
-                                
-                                # 检查是否接触，决定轮廓颜色
-                                is_touching = False
-                                overlap_ratio = 0.0
-                                if hand_box is not None and poly is not None:
-                                    is_touching, overlap_ratio = check_hand_object_contact(hand_box, poly, overlap_threshold=0.1)
-                                
-                                # 绘制多边形（可能已被 YOLOE 更新）- 使用更粗的线条
-                                if is_touching:
-                                    # 接触时用亮绿色，并添加发光效果
-                                    poly_color = (0, 255, 127)
-                                    # 绘制一个更粗的外层轮廓作为发光效果
-                                    cv2.polylines(vis, [poly.astype(np.int32)], isClosed=True, 
-                                                color=(127, 255, 127), thickness=STROKE_WIDTH + 4)
-                                    # 添加半透明的填充效果
-                                    overlay = vis.copy()
-                                    cv2.fillPoly(overlay, [poly.astype(np.int32)], (0, 255, 0))
-                                    cv2.addWeighted(overlay, 0.15, vis, 0.85, 0, vis)
-                                else:
-                                    # 未接触时用普通绿色
-                                    poly_color = (0, 255, 0)
-                                cv2.polylines(vis, [poly.astype(np.int32)], isClosed=True, color=poly_color, thickness=STROKE_WIDTH)
-                                # 多边形质心与面积
-                                poly_center, poly_area = polygon_center_and_area(poly)
-                                if poly_center:
-                                    pc = (int(poly_center[0]), int(poly_center[1]))
-                                    cv2.circle(vis, pc, 6, (0,255,0), -1)
-
-                                # 多边形外接矩形（用于周边监控）
+                            # 检查是否接触
+                            is_touching = False
+                            overlap_ratio = 0.0
+                            if hand_box is not None and poly is not None:
+                                is_touching, overlap_ratio = check_hand_object_contact(hand_box, poly, overlap_threshold=0.1)
+                            
+                            # 多边形质心与面积
+                            poly_center, poly_area = polygon_center_and_area(poly)
+                            if poly_center:
+                                # 多边形外接矩形
                                 x, y, w, h = cv2.boundingRect(poly.astype(np.int32))
-                                last_poly_box = (x, y, w, h)
+                                self.last_poly_box = (x, y, w, h)
 
-                                # ====== 对齐分数（第一条）======
+                                detection_result["object_detected"] = True
+                                detection_result["object_center"] = poly_center
+                                detection_result["object_area"] = poly_area
+                                detection_result["polygon"] = poly.tolist()
+                                detection_result["is_touching"] = is_touching
+                                detection_result["overlap_ratio"] = overlap_ratio
+
+                                # 对齐分数
                                 if hand_center and poly_center:
                                     hc = np.array(hand_center, dtype=np.float32)
                                     oc = np.array(poly_center, dtype=np.float32)
@@ -1367,10 +790,8 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                     diag = float(np.linalg.norm([W, H]))
                                     align_score = 1.0 - min(dist/(ALIGN_LOOSE_PCT*diag + 1e-6), 1.0)
                                     
-                                    # 绘制虚线引导（替代原来的实线箭头）
-                                    draw_dashed_line(vis, (hc[0], hc[1]), (oc[0], oc[1]), 
-                                                   color=(255, 255, 0), thickness=2, 
-                                                   dash_length=15, gap_length=10)
+                                    detection_result["metrics"]["hand_object_distance"] = dist
+                                    detection_result["metrics"]["align_score"] = align_score
                                     
                                     # 方向引导
                                     direction, secondary = get_guidance_direction(
@@ -1379,189 +800,395 @@ def main(headless: bool = False, prompt_name: str = None, stop_event=None):
                                     )
                                     
                                     if direction and direction != "保持":
-                                        # 根据是否接触显示不同颜色
-                                        if direction == "向前":
-                                            # 手已经接触物体，用绿色显示
-                                            guide_color = (0, 255, 0)  # 绿色
-                                            draw_text_cn(vis, f"引导: {direction} - 伸手抓取", (W//2 - 80, 40), 
-                                                       font_size=24, color=guide_color, stroke=(0, 0, 0))
-                                        else:
-                                            # 还未接触，用黄色显示
-                                            guide_color = (0, 255, 255)  # 黄色
-                                            draw_text_cn(vis, f"引导: {direction}", (W//2 - 60, 40), 
-                                                       font_size=24, color=guide_color, stroke=(0, 0, 0))
+                                        detection_result["guidance"] = direction
+                                        detection_result["status"] = "guiding"
                                         
-                                        # 显示次要信息（接触度或其他方向）
-                                        if secondary:
-                                            if isinstance(secondary, str):
-                                                # 接触度信息
-                                                draw_text_cn(vis, secondary, (W//2 - 60, 70), 
-                                                           font_size=18, color=(0, 255, 0))
-                                            else:
-                                                # 其他方向信息
-                                                draw_text_cn(vis, f"（或 {secondary}）", (W//2 - 60, 70), 
-                                                           font_size=18, color=(200, 200, 200))
-                                        
-                                        # 播放语音引导 - 确保每个方向都会播放
-                                        if t_now - last_guidance_time > GUIDANCE_INTERVAL_SEC:
-                                            # 检查方向是否改变，或者时间间隔足够
-                                            if direction != last_guidance_direction or t_now - last_guidance_time > GUIDANCE_INTERVAL_SEC * 2:
-                                                play_guidance_audio(direction)
-                                                last_guidance_direction = direction
-                                                last_guidance_time = t_now
-                                                print(f"[GUIDE] 播放引导音频: {direction}")
-                                else:
-                                    align_score = 0.0
-
-                                # 显示接触状态
-                                is_touching, overlap_ratio = check_hand_object_contact(hand_box, poly, overlap_threshold=0.1)
-                                if is_touching:
-                                    draw_text_cn(vis, f"状态: 已接触 ({overlap_ratio:.1%})", (10, 95), 
-                                               font_size=16, color=(0, 255, 0))
-                                else:
-                                    # 计算手和物体的距离
-                                    if hand_center and poly_center:
-                                        distance = np.sqrt((hand_center[0] - poly_center[0])**2 + 
-                                                         (hand_center[1] - poly_center[1])**2)
-                                        draw_text_cn(vis, f"距离: {distance:.0f}px", (10, 95), 
-                                                   font_size=16, color=FRONTEND_COLORS["muted"])
-
+                                        if t_now - self.last_guidance_time > 1.5:
+                                            if direction != self.last_guidance_direction or t_now - self.last_guidance_time > 3.0:
+                                                self.last_guidance_direction = direction
+                                                self.last_guidance_time = t_now
+                                                logger.info(f"Guidance: {direction}")
+                                    else:
+                                        detection_result["status"] = "tracking"
+                                
                                 # 成功条件：握持（放宽）
-                                if (_last_result and _last_result[0].hand_landmarks and len(_last_result[0].hand_landmarks) > 0):
-                                    l0 = _last_result[0].hand_landmarks[0]
-                                    grasp_now, grasp_score = detect_grasp(l0, W, H)
-                                else:
-                                    grasp_now, grasp_score = False, 0.0
-             
-                                # guidance_msg 相关代码已经集成到上面的引导逻辑中
+                                detection_result["grasp_now"] = grasp_now
+                                detection_result["grasp_score"] = grasp_score
 
-                                # ===== 周边监控 & 重新锁定（复用YOLO结果）=====
-                                if (track_frame_count % PERI_CHECK_EVERY == 0) and (last_poly_box is not None) and (latest_det_mask is not None):
-                                    # 直接使用刚才的YOLO检测结果，避免重复调用
-                                    px, py, pw, ph = last_poly_box
-                                    x0 = max(0, px - PERI_MONITOR_PX)
-                                    y0 = max(0, py - PERI_MONITOR_PX)
-                                    x1 = min(W - 1, px + pw + PERI_MONITOR_PX)
-                                    y1 = min(H - 1, py + ph + PERI_MONITOR_PX)
-                                    
-                                    # 检查周边区域是否有更好的检测结果
-                                    peri_area = latest_det_mask[y0:y1, x0:x1].sum()
-                                    total_area = latest_det_mask.sum()
-                                    
-                                    # 如果周边区域有显著检测结果，重新锁定
-                                    if peri_area > total_area * 0.1:  # 周边有10%以上的检测面积
-                                        edge_mask = inner_offset_edge(latest_det_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
-                                        pts = cv2.goodFeaturesToTrack(gray, mask=edge_mask, **FEATURE_PARAMS)
-                                        if pts is not None and len(pts) >= 8:
-                                            p0 = pts
-                                            old_gray = gray
-                                            lock_edge_debug = edge_mask.copy()
-                                            #print(f"[PERI] 周边重锁定，特征点数={len(p0)}")
-                            else:
-                                MODE = "SEGMENT"; old_gray = None; p0 = None; lock_edge_debug = None
                         else:
-                            MODE = "SEGMENT"; old_gray = None; p0 = None; lock_edge_debug = None
+                            self.MODE = "SEGMENT"
+                            self.old_gray = None
+                            self.p0 = None
                     else:
-                        MODE = "SEGMENT"; old_gray = None; p0 = None; lock_edge_debug = None
+                        self.MODE = "SEGMENT"
+                        self.old_gray = None
+                        self.p0 = None
                 else:
-                    MODE = "SEGMENT"; old_gray = None; p0 = None; lock_edge_debug = None
-
-  
-
-                if MODE == "SEGMENT":
-                    draw_text_cn(vis, "追踪丢失 → 正在重新识别。按 Enter 重新锁定", (10, 100), font_size=22, color=(0,0,255))
-
-                old_gray = gray
-
-            # FPS（移动到左下角样式）
-            if 'fps_hist' not in locals():
-                fps_hist = []
-            fps_hist.append(t_now)
-            if len(fps_hist) > 30:
-                fps_hist.pop(0)
-            fps = 0.0 if len(fps_hist) < 2 else (len(fps_hist)-1)/(fps_hist[-1]-fps_hist[0])
-            draw_text_cn(vis, f"FPS: {fps:.1f}", (10, 40), font_size=16, color=FRONTEND_COLORS["ok"]) 
-
-            # 右下角显示"内边界/最近一次锁定"的调试图
-            if lock_edge_debug is not None:
-                # 极小缩放并放在右下角
-                small = cv2.resize(lock_edge_debug, (0,0), fx=0.22, fy=0.22, interpolation=cv2.INTER_NEAREST)
-                sh, sw = small.shape[:2]
-                small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
-                # 右下角位置，留 10-12px 边距
-                x1 = max(8, W - sw - 12)
-                y1 = max(8, H - sh - 12)
-                y2 = y1 + sh
-                x2 = x1 + sw
-                vis[y1:y2, x1:x2] = small_bgr
-                # 标签置于图上方紧贴，使用更小字号
-                #draw_text_cn(vis, "内边界", (x1, y1 - 8), font_size=12, color=FRONTEND_COLORS["muted"], ui_hint=False)
-
-            # 底部中间的"当前指令"按钮（始终绘制，文案随音频同步）
-            draw_command_pill(vis, CURRENT_COMMAND_TEXT)
-
-            # 展示（无论 headless 与否，都会推给前端）
-            bridge_io.send_vis_bgr(vis)
-
-            # [headless] 只有非 headless 时才弹窗与键盘交互；headless 下用 waitKey(1) 让出调度
-            if not headless:
-                cv2.imshow(WINDOW, vis)
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord('q')):
-                    break
-                elif key == ord('r'):
-                    MODE = "SEGMENT"; old_gray = None; p0 = None; lock_edge_debug = None
-                elif key == 13:  # Enter：从 SEGMENT 锁定并开始 TRACK（内收 5px）
-                    if MODE == "SEGMENT":
-                        # 使用 YOLOE 进行手动锁定
-                        if use_yoloe and yoloe_backend is not None:
-                            det = yoloe_backend.segment(frame, conf=CONF_THRESHOLD, iou=0.45, imgsz=640, persist=True)
-                            if det["masks"]:
-                                # 取面积最大的那个
-                                areas = [int(m.sum()) for m in det["masks"]]
-                                j = int(np.argmax(areas))
-                                m = det["masks"][j]
-                                if m.shape[:2] != (H, W):
-                                    m = cv2.resize(m, (W, H), interpolation=cv2.INTER_NEAREST)
-                                best_mask = (m > 0.5).astype(np.uint8)
-                            else:
-                                best_mask = None
-                        else:
-                            best_mask = None
-                        if best_mask is not None:
-                            edge_mask = inner_offset_edge(best_mask, offset_px=INNER_OFFSET_PX_LOCK, edge_dilate_px=EDGE_DILATE_PX)
-                            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-                            pts = cv2.goodFeaturesToTrack(gray, mask=edge_mask, **FEATURE_PARAMS)
-                            if pts is not None and len(pts) >= 8:
-                                p0 = pts
-                                old_gray = gray
-                                MODE = "TRACK"
-                                lock_edge_debug = edge_mask.copy()
-                                track_frame_count = 0
-                                print(f"[LOCK] 内边界特征点数={len(p0)} → TRACK")
-                            else:
-                                print("[LOCK] 内边界特征点不足，请调整画面后重试。")
-                        else:
-                            print("[LOCK] 当前帧未找到有效分割，请重试。")
+                    self.MODE = "SEGMENT"
+                    self.old_gray = None
+                    self.p0 = None
             else:
-                # headless 下也调用一次 waitKey(1)，让 OpenCV 的计时器/回调得到机会，且避免 CPU 忙等
-                cv2.waitKey(1)
-                
-                # 在 headless 模式下检查停止事件
-                if stop_event and stop_event.is_set():
-                    print("[YOLOMEDIA] Received stop signal in headless mode")
-                    break
+                self.MODE = "SEGMENT"
+                self.old_gray = None
+                self.p0 = None
 
-    finally:
+            if self.MODE == "SEGMENT":
+                detection_result["status"] = "tracking_lost"
+                detection_result["guidance"] = "追踪丢失 → 正在重新识别"
+
+            self.old_gray = gray
+        
+        # FPS计算
+        self.fps_hist.append(t_now)
+        if len(self.fps_hist) > 30:
+            self.fps_hist.pop(0)
+        fps = 0.0 if len(self.fps_hist) < 2 else (len(self.fps_hist)-1)/(self.fps_hist[-1]-self.fps_hist[0])
+        
+        detection_result["fps"] = round(fps, 2)
+        detection_result["processing_time_ms"] = round((time.time() - start_time) * 1000, 2)
+        
+        return detection_result
+    
+    def process_stream(self):
+        """处理ESP32视频流"""
         try:
-            landmarker.close()
-        except Exception:
-            pass
-        #cap.release()
-        # [headless] 仅在非 headless 时销毁窗口
-        if not headless:
-            cv2.destroyAllWindows()
+            import bridge_io
+        except ImportError as e:
+            logger.error(f"Failed to import bridge_io: {e}")
+            logger.error("Please ensure bridge_io is available for ESP32 communication")
+            return
+        
+        logger.info("Starting ESP32 video stream processing")
+        
+        while not self.stop_event.is_set():
+            try:
+                # 从ESP32获取帧
+                frame = bridge_io.wait_raw_bgr(timeout_sec=0.5)
+                if frame is None:
+                    continue
+                
+                # 处理帧
+                result = self.process_frame(frame)
+                
+                # 将结果放入队列
+                result_queue.put(result)
+                
+                # 可选的：发送可视化帧到ESP32（如果bridge_io支持）
+                try:
+                    # 这里可以添加生成可视化帧的逻辑，如果需要的话
+                    # vis_frame = self.generate_visualization(frame, result)
+                    # bridge_io.send_vis_bgr(vis_frame)
+                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to send visualization frame: {e}")
+                
+                # 发送UI消息到ESP32
+                try:
+                    if result["guidance"]:
+                        bridge_io.send_ui_final(result["guidance"])
+                except Exception as e:
+                    logger.warning(f"Failed to send UI message: {e}")
+                
+                # 轻微延迟，避免占用过多CPU
+                time.sleep(0.01)
+                
+            except Exception as e:
+                logger.error(f"Error processing frame: {e}")
+                time.sleep(0.1)
+        
+        logger.info("Video stream processing stopped")
+    
+    def start(self):
+        """启动服务器"""
+        if self.running:
+            logger.warning("Server is already running")
+            return False
+        
+        # 初始化模型
+        if not self.initialize_models():
+            return False
+        
+        # 重置停止事件
+        self.stop_event.clear()
+        
+        # 启动处理线程
+        self.processing_thread = threading.Thread(target=self.process_stream)
+        self.processing_thread.daemon = True
+        self.processing_thread.start()
+        
+        self.running = True
+        logger.info("ObjectSearchServer started successfully")
+        return True
+    
+    def stop(self):
+        """停止服务器"""
+        if not self.running:
+            return
+        
+        logger.info("Stopping ObjectSearchServer...")
+        
+        # 设置停止事件
+        self.stop_event.set()
+        
+        # 等待处理线程结束
+        if self.processing_thread:
+            self.processing_thread.join(timeout=5.0)
+        
+        # 关闭模型
+        if self.landmarker:
+            try:
+                self.landmarker.close()
+                logger.info("Hand landmarker closed")
+            except Exception as e:
+                logger.error(f"Error closing landmarker: {e}")
+        
+        self.running = False
+        logger.info("ObjectSearchServer stopped")
+    
+    def get_status(self) -> Dict[str, Any]:
+        """获取服务器状态"""
+        return {
+            "running": self.running,
+            "mode": self.MODE,
+            "prompt_name": self.prompt_name,
+            "frame_count": self.FRAME_IDX,
+            "stats": result_queue.get_stats()
+        }
+    
+    def update_prompt(self, prompt_name: str) -> bool:
+        """更新目标提示词"""
+        try:
+            self.prompt_name = prompt_name
+            
+            if self.use_yoloe and self.yoloe_backend is not None:
+                self.yoloe_backend.set_text_classes([prompt_name])
+            
+            logger.info(f"Prompt name updated to: {prompt_name}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to update prompt: {e}")
+            return False
+    
+    def reset_state(self):
+        """重置服务器状态"""
+        logger.info("Resetting server state")
+        
+        # 重置所有状态变量
+        self.MODE = "SEGMENT"
+        self.last_mask = None
+        self.flow_mask = None
+        self.flow_grace = 0
+        self.last_seen_ts = 0.0
+        self.locked_id = None
+        
+        self.auto_lock_start_time = None
+        self.last_detected_mask = None
+        
+        self.flash_start_time = None
+        self.flash_mask = None
+        
+        self.center_guide_start = None
+        self.center_reached = False
+        self.last_center_guide_time = 0
+        
+        self.old_gray = None
+        self.p0 = None
+        self.track_frame_count = 0
+        self.last_poly_box = None
+        
+        self.background_points = None
+        self.old_background_gray = None
+        
+        self.last_guidance_time = 0
+        self.last_guidance_direction = None
+        
+        logger.info("Server state reset completed")
 
 
+# ========= REST API 接口 =========
+from flask import Flask, jsonify, request, Response
+import threading
+
+app = Flask(__name__)
+server_instance = None
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    """获取服务器状态"""
+    if server_instance is None:
+        return jsonify({"error": "Server not initialized"}), 500
+    
+    status = server_instance.get_status()
+    return jsonify(status)
+
+@app.route('/api/latest', methods=['GET'])
+def get_latest_result():
+    """获取最新的检测结果"""
+    result = result_queue.get_latest()
+    if result:
+        return jsonify(result)
+    else:
+        return jsonify({"error": "No results available"}), 404
+
+@app.route('/api/results', methods=['GET'])
+def get_recent_results():
+    """获取最近的检测结果"""
+    max_items = request.args.get('max', default=10, type=int)
+    results = result_queue.get_all(max_items)
+    return jsonify({
+        "count": len(results),
+        "results": results
+    })
+
+@app.route('/api/stats', methods=['GET'])
+def get_stats():
+    """获取统计信息"""
+    stats = result_queue.get_stats()
+    return jsonify(stats)
+
+@app.route('/api/update_prompt', methods=['POST'])
+def update_prompt():
+    """更新目标提示词"""
+    if server_instance is None:
+        return jsonify({"error": "Server not initialized"}), 500
+    
+    data = request.json
+    if not data or 'prompt_name' not in data:
+        return jsonify({"error": "prompt_name is required"}), 400
+    
+    success = server_instance.update_prompt(data['prompt_name'])
+    
+    if success:
+        return jsonify({
+            "success": True,
+            "prompt_name": data['prompt_name']
+        })
+    else:
+        return jsonify({"error": "Failed to update prompt"}), 500
+
+@app.route('/api/control/start', methods=['POST'])
+def start_server():
+    """启动服务器"""
+    global server_instance
+    
+    if server_instance is None:
+        # 从请求中获取配置
+        data = request.json or {}
+        prompt_name = data.get('prompt_name', PROMPT_NAME)
+        
+        # 创建服务器实例
+        server_instance = ObjectSearchServer(prompt_name=prompt_name)
+    
+    if server_instance.start():
+        return jsonify({"success": True, "message": "Server started"})
+    else:
+        return jsonify({"error": "Failed to start server"}), 500
+
+@app.route('/api/control/stop', methods=['POST'])
+def stop_server():
+    """停止服务器"""
+    global server_instance
+    
+    if server_instance is None:
+        return jsonify({"error": "Server not initialized"}), 400
+    
+    server_instance.stop()
+    return jsonify({"success": True, "message": "Server stopped"})
+
+@app.route('/api/control/reset', methods=['POST'])
+def reset_server():
+    """重置服务器状态"""
+    global server_instance
+    
+    if server_instance is None:
+        return jsonify({"error": "Server not initialized"}), 400
+    
+    server_instance.reset_state()
+    return jsonify({"success": True, "message": "Server state reset"})
+
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    """健康检查"""
+    if server_instance is None or not server_instance.running:
+        return jsonify({"status": "not_running"}), 503
+    
+    return jsonify({
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat()
+    })
+
+@app.route('/')
+def index():
+    """API文档页面"""
+    return """
+    <h1>Object Search Server API</h1>
+    <h2>Endpoints:</h2>
+    <ul>
+        <li>GET /api/status - 获取服务器状态</li>
+        <li>GET /api/latest - 获取最新检测结果</li>
+        <li>GET /api/results?max=10 - 获取最近的结果</li>
+        <li>GET /api/stats - 获取统计信息</li>
+        <li>POST /api/update_prompt - 更新目标提示词</li>
+        <li>POST /api/control/start - 启动服务器</li>
+        <li>POST /api/control/stop - 停止服务器</li>
+        <li>POST /api/control/reset - 重置服务器状态</li>
+        <li>GET /api/health - 健康检查</li>
+    </ul>
+    """
+
+def run_api_server(host='0.0.0.0', port=5000):
+    """启动API服务器"""
+    logger.info(f"Starting API server on {host}:{port}")
+    app.run(host=host, port=port, threaded=True)
+
+
+# ========= 主函数 =========
 if __name__ == "__main__":
-    main()
+    import argparse
+    
+    parser = argparse.ArgumentParser(description='Object Search Server for ESP32')
+    parser.add_argument('--prompt', type=str, default=PROMPT_NAME, help='Prompt name for object detection')
+    parser.add_argument('--api-port', type=int, default=5000, help='Port for REST API server')
+    parser.add_argument('--api-host', type=str, default='0.0.0.0', help='Host for REST API server')
+    parser.add_argument('--no-api', action='store_true', help='Disable REST API server')
+    
+    args = parser.parse_args()
+    
+    # 创建服务器实例
+    server_instance = ObjectSearchServer(prompt_name=args.prompt)
+    
+    # 启动服务器
+    if not server_instance.start():
+        logger.error("Failed to start server")
+        exit(1)
+    
+    # 启动API服务器（可选）
+    if not args.no_api:
+        api_thread = threading.Thread(
+            target=run_api_server,
+            kwargs={
+                'host': args.api_host,
+                'port': args.api_port
+            }
+        )
+        api_thread.daemon = True
+        api_thread.start()
+        logger.info(f"REST API available at http://{args.api_host}:{args.api_port}")
+    
+    try:
+        # 等待主线程结束（如果有API服务器，它会在后台运行）
+        if args.no_api:
+            # 如果没有API，等待Ctrl+C
+            while server_instance.running:
+                time.sleep(1)
+        else:
+            # 如果有API，主线程可以等待API线程
+            api_thread.join()
+            
+    except KeyboardInterrupt:
+        logger.info("Received keyboard interrupt, shutting down...")
+    finally:
+        # 停止服务器
+        server_instance.stop()
+    
+    logger.info("Server shutdown complete")

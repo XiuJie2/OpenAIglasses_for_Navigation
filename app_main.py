@@ -12,7 +12,6 @@ from navigation_master import NavigationMaster, OrchestratorResult
 from workflow_blindpath import BlindPathNavigator
 # 新增：导入过马路导航器
 from workflow_crossstreet import CrossStreetNavigator
-import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import HTMLResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,7 +22,14 @@ import numpy as np
 from ultralytics import YOLO
 from obstacle_detector_client import ObstacleDetectorClient
 
-import torch  # 添加这行
+# 禁用所有GPU相关的环境变量
+os.environ["CUDA_VISIBLE_DEVICES"] = "-1"  # 使用-1表示不使用任何GPU
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"   # 减少TensorFlow日志
+
+# 强制PyTorch使用CPU
+import torch
+torch.cuda.is_available = lambda: False  # 重写为始终返回False
+torch.set_default_tensor_type(torch.FloatTensor)  # 使用CPU tensor
 
 
 import mediapipe as mp
@@ -114,6 +120,7 @@ orchestrator = None  # 新增
 # 【新增】omni对话状态标志
 omni_conversation_active = False  # 标记omni对话是否正在进行
 omni_previous_nav_state = None  # 保存omni激活前的导航状态，用于恢复
+
 
 # 【新增】模型加载函数
 def load_navigation_models():
@@ -1314,6 +1321,6 @@ def get_camera_ws():
 if __name__ == "__main__":
     uvicorn.run(
         app, host="0.0.0.0", port=8081,
-        log_level="warning", access_log=False,
+        log_level="info", access_log=True,
         loop="asyncio", workers=1, reload=False
     )

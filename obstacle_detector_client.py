@@ -10,7 +10,7 @@ from ultralytics import YOLOE
 from typing import List, Dict, Any
 
 logger = logging.getLogger(__name__)
-
+os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # 完全禁用CUDA
 # --- GPU/CPU & AMP 配置 (从 blindpath 工作流迁移而来，保持一致) ---
 DEVICE = os.getenv("AIGLASS_DEVICE", "cuda:0")
 if DEVICE.startswith("cuda") and not torch.cuda.is_available():
